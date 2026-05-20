@@ -1,100 +1,100 @@
+import os
 from pathlib import Path
 import win32com.client
+import win32gui
+import win32con
+import pythoncom
 import time
 
 BASE_DIR = Path(__file__).parent.resolve()
 
+def get_foreground_window():
+    return win32gui.GetForegroundWindow()
+
+def restore_foreground(hwnd):
+    if hwnd:
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        win32gui.SetForegroundWindow(hwnd)
 
 def merge_presentations(files, output_file, progress_callback=None):
     if len(files) < 2:
-        raise Exception("צריך לפחות 2 מצגות (PPTX)")
+        raise Exception("צריך לפחות 2 מצגות (PPTX) לצורך מיזוג")
 
-    # אתחול אובייקט ה-Application של PowerPoint
-    powerpoint = win32com.client.Dispatch("PowerPoint.Application")
-    main_presentation = None
+    output_path = Path(output_file).resolve()
+    temp_output_path = output_path.with_name(f"~temp_{output_path.name}")
+
+    # שומרים את החלון הפעיל של המשתמש לפני שמתחילים
+    user_window = get_foreground_window()
+
+    pythoncom.CoInitialize()
 
     try:
-        # פותחים את המצגת הראשונה כבסיס (במצב חבוי WithWindow=0)
-        # זה מונע את פתיחת המצגת הריקה המיותרת ופותר את בעיית ה-SlideLayouts
+        powerpoint = win32com.client.DispatchEx("PowerPoint.Application")
+        powerpoint.Visible = True
+        powerpoint.WindowState = 2
+        restore_foreground(user_window)
+    except Exception as dispatch_err:
+        raise Exception(f"שגיאה באתחול PowerPoint: {str(dispatch_err)}")
+
+    main_presentation = None
+    try:
         main_presentation = powerpoint.Presentations.Open(
             str(Path(files[0]).resolve()),
             ReadOnly=0,
-            Untitled=0,
-            WithWindow=0
+            WithWindow=1
         )
+        restore_foreground(user_window)
 
         if progress_callback:
             progress_callback(files[0])
 
-    except Exception as e:
-        try:
-            powerpoint.Quit()
-        except:
-            pass
-        raise Exception(f"נכשל בפתיחת המצגת הראשית: {str(e)}")
-
-    try:
-        # עוברים על שאר הקבצים (החל מהשני) וממזגים אותם פנימה
         for pptx_file in files[1:]:
             full_path = str(Path(pptx_file).resolve())
 
-            # 1. פתיחה חבויה של מצגת המקור כדי לבדוק כמות שקפים
-            source_pres = powerpoint.Presentations.Open(full_path, ReadOnly=1, WithWindow=0)
+            source_pres = powerpoint.Presentations.Open(
+                full_path,
+                ReadOnly=1,
+                WithWindow=1
+            )
+            restore_foreground(user_window)
+
             slide_count = source_pres.Slides.Count
-            source_pres.Close()
-
             if slide_count > 0:
-                # שומרים את מיקום השקף האחרון הנוכחי במצגת הממוזגת לפני ההזרקה
-                start_index = main_presentation.Slides.Count
+                source_pres.Slides.Range().Copy()
+                time.sleep(0.2)
+                main_presentation.Windows(1).Activate()
+                last_slide_idx = main_presentation.Slides.Count
+                main_presentation.Slides(last_slide_idx).Select()
+                powerpoint.CommandBars.ExecuteMso("PasteSourceFormatting")
+                time.sleep(0.2)
+                restore_foreground(user_window)  # מחזיר את המשתמש לקדמה אחרי ה-Paste
 
-                # 2. הזרקת השקפים. פקודה זו שומרת על הטקסטים והאלמנטים
-                main_presentation.Slides.InsertFromFile(
-                    full_path,
-                    start_index,
-                    1,
-                    slide_count
-                )
-
-                # 3. פתיחת מצגת המקור שוב כדי להחיל את ערכת העיצוב (Design) בצורה ישירה
-                # ללא צורך בלולאות פנימיות על ה-Layouts שגורמות לשגיאות ברקע
-                source_pres = powerpoint.Presentations.Open(full_path, ReadOnly=1, WithWindow=0)
-
-                for i in range(1, slide_count + 1):
-                    inserted_slide_idx = start_index + i
-                    target_slide = main_presentation.Slides(inserted_slide_idx)
-                    source_slide = source_pres.Slides(i)
-
-                    try:
-                        # השמה ישירה של ה-Design והרמוניה מול ה-Master המקורי
-                        target_slide.Design = source_slide.Design
-
-                        # במקום לגעת ב-CustomLayout הבעייתי, אנחנו מאפשרים ל-PowerPoint
-                        # להשתמש במבנה הקיים שהגיע מה-InsertFromFile
-                        if source_slide.FollowMasterBackground == 0:
-                            target_slide.FollowMasterBackground = 0
-                            target_slide.Background.Fill.ForeColor.RGB = source_slide.Background.Fill.ForeColor.RGB
-                    except Exception as slide_err:
-                        # החלקה של שגיאות קטנות כדי למנוע קריסה קריטית
-                        print(f"הערה: עיצוב שקף {i} הוחל חלקית ({slide_err})")
-                        continue
-
-                source_pres.Close()
-                time.sleep(0.05)
+            source_pres.Close()
+            restore_foreground(user_window)
 
             if progress_callback:
                 progress_callback(pptx_file)
+            time.sleep(0.1)
 
-        # שמירת המצגת הממוזגת הסופית בנתיב החדש
-        main_presentation.SaveAs(str(Path(output_file).resolve()))
+        if temp_output_path.exists():
+            os.remove(temp_output_path)
+        main_presentation.SaveAs(str(temp_output_path))
+        main_presentation.Close()
 
+    except Exception as e:
+        raise Exception(f"המיזוג נכשל במהלך העבודה: {str(e)}")
     finally:
-        # סגירה הרמטית ובטוחה של תהליכי הרקע מהזיכרון
-        try:
-            if main_presentation:
-                main_presentation.Close()
-        except:
-            pass
         try:
             powerpoint.Quit()
         except:
             pass
+        pythoncom.CoUninitialize()
+        time.sleep(0.3)
+
+    try:
+        if temp_output_path.exists():
+            if output_path.exists():
+                os.remove(output_path)
+            os.rename(temp_output_path, output_path)
+    except Exception as file_err:
+        raise Exception(f"המיזוג הצליח, אך נכשל בשחזור שם הקובץ הסופי: {str(file_err)}")
