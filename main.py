@@ -8,30 +8,71 @@ import time
 
 BASE_DIR = Path(__file__).parent.resolve()
 
+
 def get_foreground_window():
     return win32gui.GetForegroundWindow()
+
 
 def restore_foreground(hwnd):
     if hwnd:
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
         win32gui.SetForegroundWindow(hwnd)
 
+
+def is_output_file_locked(file_path):
+    """
+    בודק האם קובץ היעד קיים ונעול (פתוח ע"י המשתמש)
+    """
+    path = Path(file_path).resolve()
+    if not path.exists():
+        return False
+
+    try:
+        os.rename(str(path), str(path))
+        return False
+    except OSError:
+        return True
+
+
 def merge_presentations(files, output_file, progress_callback=None):
     if len(files) < 2:
         raise Exception("צריך לפחות 2 מצגות (PPTX) לצורך מיזוג")
 
+    if is_output_file_locked(output_file):
+        raise Exception(
+            f"לא ניתן לבצע מיזוג. קובץ היעד '{Path(output_file).name}' פתוח כרגע בתוכנה אחרת. נא לסגור אותו ולנסות שוב.")
+
     output_path = Path(output_file).resolve()
     temp_output_path = output_path.with_name(f"~temp_{output_path.name}")
 
-    # שומרים את החלון הפעיל של המשתמש לפני שמתחילים
     user_window = get_foreground_window()
 
     pythoncom.CoInitialize()
 
+    powerpoint = None
     try:
         powerpoint = win32com.client.DispatchEx("PowerPoint.Application")
         powerpoint.Visible = True
-        powerpoint.WindowState = 2
+
+        # --- פתרון בעיית המרכוז וה-DPI ---
+        window_width = 200
+        window_height = 200
+
+        # טריק: נמקסם את החלון לשבריר שנייה רק כדי לקבל את המימדים המקסימליים ב-Points של האפליקציה
+        powerpoint.WindowState = 3  # ppWindowMaximized
+        max_width = powerpoint.Width
+        max_height = powerpoint.Height
+
+        # עכשיו נחזיר אותו למצב רגיל ונחשב מרכז מדויק לפי יחידות המידה של PowerPoint
+        powerpoint.WindowState = 1  # ppWindowNormal
+        powerpoint.Width = window_width
+        powerpoint.Height = window_height
+
+        # חישוב המרכז על בסיס יחידות המידה הפנימיות
+        powerpoint.Left = int((max_width - window_width) / 2)
+        powerpoint.Top = int((max_height - window_height) / 2)
+        # ---------------------------------
+
         restore_foreground(user_window)
     except Exception as dispatch_err:
         raise Exception(f"שגיאה באתחול PowerPoint: {str(dispatch_err)}")
@@ -67,7 +108,7 @@ def merge_presentations(files, output_file, progress_callback=None):
                 main_presentation.Slides(last_slide_idx).Select()
                 powerpoint.CommandBars.ExecuteMso("PasteSourceFormatting")
                 time.sleep(0.2)
-                restore_foreground(user_window)  # מחזיר את המשתמש לקדמה אחרי ה-Paste
+                restore_foreground(user_window)
 
             source_pres.Close()
             restore_foreground(user_window)
@@ -85,7 +126,10 @@ def merge_presentations(files, output_file, progress_callback=None):
         raise Exception(f"המיזוג נכשל במהלך העבודה: {str(e)}")
     finally:
         try:
-            powerpoint.Quit()
+            if powerpoint:
+                powerpoint.WindowState = 3  # מחזירים למסך מלא לפני הסגירה
+                time.sleep(0.1)
+                powerpoint.Quit()
         except:
             pass
         pythoncom.CoUninitialize()
